@@ -78,7 +78,12 @@ static bool valid_username(const std::string &s) {
 
 static bool valid_isbn(const std::string &s) {
     if (s.empty() || (int)s.size() > 20) return false;
-    for (char c : s) if (!is_visible_no_quote(c)) return false;
+    // Spec: ASCII except invisible (no quote restriction for ISBN)
+    // But excluded: space (must not have space - tokens are split by space)
+    for (char c : s) {
+        if (!is_visible(c)) return false;
+        if (c == ' ') return false;
+    }
     return true;
 }
 
@@ -357,43 +362,42 @@ static std::vector<std::string> split_tokens(const std::string &s) {
 // So we tokenize: first split by spaces (treating multiple spaces as one), but if a
 // token begins with -key=" we keep appending until we find a token ending with ".
 
+// Merge tokens split by spaces but belonging to the same quoted value of
+// an option like -name="...". We only merge when the first quote is at the
+// `=` position (a real option value); in every other case we leave tokens
+// as split.
 static std::vector<std::string> smart_tokens(const std::string &s) {
     std::vector<std::string> raw = split_tokens(s);
-    // Post-process: merge tokens that are inside unfinished quotes.
     std::vector<std::string> out;
     int i = 0;
     while (i < (int)raw.size()) {
         const std::string &t = raw[i];
-        // Check if it contains a quote character
-        bool has_quote = false;
-        for (char c : t) if (c == '"') { has_quote = true; break; }
-        if (!has_quote) {
+        // Detect option-prefixed quoted token: starts with '-', has '="'
+        // with odd number of quotes total.
+        bool merge_candidate = false;
+        if (!t.empty() && t[0] == '-') {
+            size_t eq = t.find('=');
+            if (eq != std::string::npos && eq + 1 < t.size() && t[eq + 1] == '"') {
+                int qcount = 0;
+                for (char c : t) if (c == '"') qcount++;
+                if (qcount % 2 == 1) merge_candidate = true;
+            }
+        }
+        if (!merge_candidate) {
             out.push_back(t);
             i++;
             continue;
         }
-        // Count quotes; if even, token is self-contained
         int qcount = 0;
         for (char c : t) if (c == '"') qcount++;
-        if (qcount % 2 == 0) {
-            out.push_back(t);
-            i++;
-            continue;
-        }
-        // Need to merge with following tokens
         std::string acc = t;
         i++;
-        bool ok = false;
-        while (i < (int)raw.size()) {
+        while (i < (int)raw.size() && qcount % 2 == 1) {
             acc.push_back(' ');
             acc += raw[i];
-            int q2 = 0;
-            for (char c : raw[i]) if (c == '"') q2++;
-            qcount += q2;
+            for (char c : raw[i]) if (c == '"') qcount++;
             i++;
-            if (qcount % 2 == 0) { ok = true; break; }
         }
-        (void)ok;
         out.push_back(acc);
     }
     return out;
