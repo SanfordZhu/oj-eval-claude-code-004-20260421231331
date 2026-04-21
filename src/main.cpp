@@ -34,13 +34,13 @@ struct BookRec {
     char name[64];
     char author[64];
     char keyword[64]; // full raw keyword string (with | separators)
-    double price;
+    int64_t price_cents; // integer cents for precision
     int64_t stock;
 };
 
 struct FinanceRec {
-    double income;
-    double expenditure;
+    int64_t income_cents;
+    int64_t expenditure_cents;
 };
 
 // --------------------- Utility ---------------------
@@ -101,20 +101,43 @@ static bool parse_uint32(const std::string &s, int &v) {
     return true;
 }
 
-static bool parse_price(const std::string &s, double &v) {
+// Parse a decimal price string into integer cents (value * 100).
+// Allows at most 2 decimal digits; returns false otherwise.
+static bool parse_price_cents(const std::string &s, int64_t &cents) {
     if (s.empty() || s.size() > 13) return false;
     int dotcount = 0;
-    for (char c : s) {
-        if (c == '.') { dotcount++; if (dotcount > 1) return false; }
-        else if (!is_digit_char(c)) return false;
+    int dot_pos = -1;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (c == '.') {
+            dotcount++;
+            if (dotcount > 1) return false;
+            dot_pos = (int)i;
+        } else if (!is_digit_char(c)) {
+            return false;
+        }
     }
-    // At least one digit
     bool has_digit = false;
     for (char c : s) if (is_digit_char(c)) { has_digit = true; break; }
     if (!has_digit) return false;
-    try {
-        v = std::stod(s);
-    } catch (...) { return false; }
+    std::string int_part, frac_part;
+    if (dot_pos == -1) {
+        int_part = s;
+    } else {
+        int_part = s.substr(0, dot_pos);
+        frac_part = s.substr(dot_pos + 1);
+    }
+    // At most 2 frac digits
+    if (frac_part.size() > 2) return false;
+    while (frac_part.size() < 2) frac_part.push_back('0');
+    int64_t ip = 0;
+    for (char c : int_part) {
+        ip = ip * 10 + (c - '0');
+        if (ip > 100000000000LL) return false; // overflow guard
+    }
+    int64_t fp = 0;
+    for (char c : frac_part) fp = fp * 10 + (c - '0');
+    cents = ip * 100 + fp;
     return true;
 }
 
@@ -184,12 +207,13 @@ static void set_str_field(char *buf, int maxlen, const std::string &s) {
     memcpy(buf, s.c_str(), len);
 }
 
-// Output a price formatted to 2 decimals
-static void print_price(double v) {
+// Output a price (stored as integer cents) formatted to 2 decimals.
+static void print_price_cents(int64_t cents) {
+    if (cents < 0) cents = -cents;
+    int64_t whole = cents / 100;
+    int frac = (int)(cents % 100);
     char buf[64];
-    // Avoid negative zero
-    if (v < 0 && v > -0.005) v = 0;
-    snprintf(buf, sizeof(buf), "%.2f", v);
+    snprintf(buf, sizeof(buf), "%lld.%02d", (long long)whole, frac);
     std::cout << buf;
 }
 
@@ -211,8 +235,8 @@ static void finance_open(const std::string &fname) {
     }
 }
 
-static void finance_append(double income, double expenditure) {
-    FinanceRec r{income, expenditure};
+static void finance_append(int64_t income_cents, int64_t expenditure_cents) {
+    FinanceRec r{income_cents, expenditure_cents};
     finance_file.seekp(sizeof(int32_t) + (std::streamoff)finance_count * sizeof(FinanceRec));
     finance_file.write(reinterpret_cast<const char *>(&r), sizeof(FinanceRec));
     finance_count++;
@@ -220,7 +244,7 @@ static void finance_append(double income, double expenditure) {
     finance_file.write(reinterpret_cast<const char *>(&finance_count), sizeof(int32_t));
 }
 
-static void finance_get_sum(int n, double &inc, double &exp) {
+static void finance_get_sum(int n, int64_t &inc, int64_t &exp) {
     inc = 0;
     exp = 0;
     int start = finance_count - n;
@@ -228,8 +252,8 @@ static void finance_get_sum(int n, double &inc, double &exp) {
     for (int i = start; i < finance_count; i++) {
         finance_file.seekg(sizeof(int32_t) + (std::streamoff)i * sizeof(FinanceRec));
         finance_file.read(reinterpret_cast<char *>(&r), sizeof(FinanceRec));
-        inc += r.income;
-        exp += r.expenditure;
+        inc += r.income_cents;
+        exp += r.expenditure_cents;
     }
 }
 
@@ -501,7 +525,7 @@ static void print_book(const BookRec &b) {
     std::cout << to_str_field(b.name, 64) << '\t';
     std::cout << to_str_field(b.author, 64) << '\t';
     std::cout << to_str_field(b.keyword, 64) << '\t';
-    print_price(b.price);
+    print_price_cents(b.price_cents);
     std::cout << '\t' << b.stock << '\n';
 }
 
@@ -603,10 +627,10 @@ static void cmd_buy(const std::vector<std::string> &args) {
     BookRec b = book_store.read(id);
     if (b.stock < qty) { fail(); return; }
     b.stock -= qty;
-    double total = b.price * qty;
+    int64_t total_cents = b.price_cents * (int64_t)qty;
     book_store.write(id, b);
-    finance_append(total, 0.0);
-    print_price(total);
+    finance_append(total_cents, 0);
+    print_price_cents(total_cents);
     std::cout << '\n';
 }
 
@@ -620,7 +644,7 @@ static void cmd_select(const std::vector<std::string> &args) {
         BookRec b;
         memset(&b, 0, sizeof(BookRec));
         set_str_field(b.isbn, 24, args[1]);
-        b.price = 0.0;
+        b.price_cents = 0;
         b.stock = 0;
         id = book_store.append(b);
         isbn_index.insert(ISBNKey(args[1]), id);
@@ -638,7 +662,7 @@ static void cmd_modify(const std::vector<std::string> &args) {
     bool has_isbn = false, has_name = false, has_author = false, has_kw = false, has_price = false;
     std::string n_isbn, n_name, n_author, n_kw_raw;
     std::vector<std::string> n_kws;
-    double n_price = 0;
+    int64_t n_price_cents = 0;
 
     for (size_t i = 1; i < args.size(); i++) {
         const std::string &t = args[i];
@@ -670,7 +694,7 @@ static void cmd_modify(const std::vector<std::string> &args) {
             if (has_price) { fail(); return; }
             has_price = true;
             std::string v = t.substr(7);
-            if (!parse_price(v, n_price)) { fail(); return; }
+            if (!parse_price_cents(v, n_price_cents)) { fail(); return; }
         } else {
             fail();
             return;
@@ -695,7 +719,7 @@ static void cmd_modify(const std::vector<std::string> &args) {
     if (has_name) set_str_field(b.name, 64, n_name);
     if (has_author) set_str_field(b.author, 64, n_author);
     if (has_kw) set_str_field(b.keyword, 64, n_kw_raw);
-    if (has_price) b.price = n_price;
+    if (has_price) b.price_cents = n_price_cents;
     add_book_indexes(b, id);
     book_store.write(id, b);
 }
@@ -706,25 +730,24 @@ static void cmd_import(const std::vector<std::string> &args) {
     if (login_stack.empty() || login_stack.back().selected_book_id == -1) { fail(); return; }
     int qty;
     if (!parse_uint32(args[1], qty) || qty <= 0) { fail(); return; }
-    double cost;
-    if (!parse_price(args[2], cost) || cost <= 0) { fail(); return; }
+    int64_t cost_cents;
+    if (!parse_price_cents(args[2], cost_cents) || cost_cents <= 0) { fail(); return; }
     int32_t id = login_stack.back().selected_book_id;
     BookRec b = book_store.read(id);
     b.stock += qty;
     book_store.write(id, b);
-    finance_append(0.0, cost);
+    finance_append(0, cost_cents);
 }
 
 static void cmd_show_finance(const std::vector<std::string> &args) {
     if (current_priv() < 7) { fail(); return; }
-    // args[0] = "show", args[1] = "finance", optional args[2] = count
     if (args.size() == 2) {
-        double inc = 0, exp = 0;
+        int64_t inc = 0, exp = 0;
         finance_get_sum(finance_count, inc, exp);
         std::cout << "+ ";
-        print_price(inc);
+        print_price_cents(inc);
         std::cout << " - ";
-        print_price(exp);
+        print_price_cents(exp);
         std::cout << '\n';
         return;
     }
@@ -736,12 +759,12 @@ static void cmd_show_finance(const std::vector<std::string> &args) {
         std::cout << '\n';
         return;
     }
-    double inc = 0, exp = 0;
+    int64_t inc = 0, exp = 0;
     finance_get_sum(n, inc, exp);
     std::cout << "+ ";
-    print_price(inc);
+    print_price_cents(inc);
     std::cout << " - ";
-    print_price(exp);
+    print_price_cents(exp);
     std::cout << '\n';
 }
 
